@@ -17,7 +17,11 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.Objects;
+import java.util.Map;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
+import moe.kyokobot.koe.internal.handler.DiscordUDPConnection;
 
 public class MediaConnectionImpl implements MediaConnection, MediaConnectionExperimental {
     private static final Logger logger = LoggerFactory.getLogger(MediaConnectionImpl.class);
@@ -36,6 +40,9 @@ public class MediaConnectionImpl implements MediaConnection, MediaConnectionExpe
     private AudioFrameProvider audioSender;
     private VideoFrameProvider videoSender;
     private DAVEManager daveManager;
+    private final Map<Integer, String> audioSsrcUsers = new ConcurrentHashMap<>();
+    private final Map<String, Integer> userAudioSsrcs = new ConcurrentHashMap<>();
+    private final AtomicLong transportGeneration = new AtomicLong();
 
     public MediaConnectionImpl(@NotNull KoeClientImpl client, long guildId) {
         this.client = Objects.requireNonNull(client);
@@ -51,6 +58,9 @@ public class MediaConnectionImpl implements MediaConnection, MediaConnectionExpe
     public CompletionStage<Void> connect(VoiceServerInfo info) {
         this.disconnect();
         this.createDAVEManager();
+        audioSsrcUsers.clear();
+        userAudioSsrcs.clear();
+        var generation = transportGeneration.incrementAndGet();
 
         var gatewayFactory = client.getGatewayVersion().getFactory();
         var conn = gatewayFactory.create(this, info);
@@ -58,6 +68,7 @@ public class MediaConnectionImpl implements MediaConnection, MediaConnectionExpe
         return conn.start().thenAccept(nothing -> {
             MediaConnectionImpl.this.info = info;
             MediaConnectionImpl.this.gatewayConnection = conn;
+            dispatcher.transportGenerationChanged(guildId, info.getChannelId(), generation);
 
             MediaValve valve = conn.getValve();
             if (valve != null && getOptions().isDeafened()) {
@@ -256,6 +267,21 @@ public class MediaConnectionImpl implements MediaConnection, MediaConnectionExpe
     }
 
     @Override
+    public void executeOnTransport(Runnable operation) {
+        Objects.requireNonNull(operation);
+        var handler = connectionHandler;
+        if (!(handler instanceof DiscordUDPConnection)) {
+            throw new IllegalStateException("No active Discord UDP transport");
+        }
+        ((DiscordUDPConnection) handler).executeOnEventLoop(operation);
+    }
+
+    @Override
+    public long getTransportGeneration() {
+        return transportGeneration.get();
+    }
+
+    @Override
     public void close() {
         if (this.audioSender != null) {
             this.audioSender.dispose();
@@ -284,6 +310,63 @@ public class MediaConnectionImpl implements MediaConnection, MediaConnectionExpe
 
     public void setConnectionHandler(ConnectionHandler<?> connectionHandler) {
         this.connectionHandler = connectionHandler;
+    }
+
+    public void updateUserStreams(String userId, int audioSsrc) {
+        var previous = userAudioSsrcs.remove(userId);
+        if (previous != null) {
+            audioSsrcUsers.remove(previous, userId);
+        }
+        if (audioSsrc != 0) {
+            userAudioSsrcs.put(userId, audioSsrc);
+            audioSsrcUsers.put(audioSsrc, userId);
+        }
+    }
+
+    public void removeUserStreams(String userId) {
+        var previous = userAudioSsrcs.remove(userId);
+        if (previous != null) {
+            audioSsrcUsers.remove(previous, userId);
+        }
+    }
+
+    @Nullable
+    public String getUserIdForAudioSsrc(int audioSsrc) {
+        return audioSsrcUsers.get(audioSsrc);
+    }
+
+    public void dispatchInboundAudio(int ssrc, int sequence, long timestamp,
+                                     long receivedNanos, boolean marker, boolean dave,
+                                     int[] csrcs, int extensionProfile, int extensionWords,
+                                     byte[] opus) {
+        var user = audioSsrcUsers.get(ssrc);
+        if (user == null) {
+            return;
+        }
+        long userId;
+        try {
+            userId = Long.parseUnsignedLong(user);
+        } catch (NumberFormatException ignored) {
+            logger.warn("Ignoring invalid Discord voice user ID {}", user);
+            return;
+        }
+        if (userId == client.getClientId() || ssrc == getOutboundSsrc()) {
+            return;
+        }
+        var voiceInfo = info;
+        if (voiceInfo == null) {
+            return;
+        }
+        dispatcher.audioFrameReceived(new ReceivedAudioFrame(
+                guildId, voiceInfo.getChannelId(), userId, ssrc, sequence, timestamp,
+                transportGeneration.get(), receivedNanos, marker, dave, csrcs,
+                extensionProfile, extensionWords, opus));
+    }
+
+    private int getOutboundSsrc() {
+        var handler = connectionHandler;
+        return handler instanceof DiscordUDPConnection
+                ? ((DiscordUDPConnection) handler).getSsrc() : 0;
     }
 
     public DAVEManager getDAVEManager() {

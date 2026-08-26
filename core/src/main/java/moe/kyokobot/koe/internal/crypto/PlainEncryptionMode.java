@@ -11,6 +11,16 @@ public class PlainEncryptionMode implements EncryptionMode {
     }
 
     @Override
+    public boolean unbox(ByteBuf packet, int headerLength, ByteBuf output, byte[] secretKey) {
+        if (headerLength < 12 || packet.readableBytes() < headerLength) {
+            return false;
+        }
+        output.writeBytes(packet, packet.readerIndex() + headerLength,
+                packet.readableBytes() - headerLength);
+        return true;
+    }
+
+    @Override
     public String getName() {
         return "plain";
     }

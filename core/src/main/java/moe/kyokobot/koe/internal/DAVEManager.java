@@ -6,6 +6,7 @@ import moe.kyokobot.koe.internal.json.JsonObject;
 import moe.kyokobot.libdave.*;
 import moe.kyokobot.libdave.netty.NettyDaveFactory;
 import moe.kyokobot.libdave.netty.NettyEncryptor;
+import moe.kyokobot.libdave.netty.NettyDecryptor;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
@@ -28,6 +29,8 @@ public class DAVEManager implements AutoCloseable {
     private final Set<String> recognizedUserIds = ConcurrentHashMap.newKeySet();
     private final Map<String, byte[]> activeE2EEUsers = new ConcurrentHashMap<>();
     private final Map<Integer, Integer> pendingTransitions = new ConcurrentHashMap<>();
+    private final Map<String, NettyDecryptor> userDecryptors = new ConcurrentHashMap<>();
+    private final Map<String, KeyRatchet> userKeyRatchets = new ConcurrentHashMap<>();
     private final int maxProtocolVersion;
 
     private final StampedLock sessionLock = new StampedLock();
@@ -91,7 +94,17 @@ public class DAVEManager implements AutoCloseable {
 
     private void addUserLocked(String userId) {
         recognizedUserIds.add(userId);
-        // TODO: Setup decryption
+        if (selfUserIdString.equals(userId)) {
+            return;
+        }
+        userDecryptors.computeIfAbsent(userId, ignored -> {
+            var decryptor = factory.fromDecryptor(factory.createDecryptor());
+            decryptor.transitionToPassthroughMode(true);
+            return decryptor;
+        });
+        if (currentProtocolVersion > 0 && activeE2EEUsers.containsKey(userId)) {
+            setupKeyRatchetForUser(userId, currentProtocolVersion);
+        }
     }
 
     public void removeUser(String userId) {
@@ -107,7 +120,38 @@ public class DAVEManager implements AutoCloseable {
     private void removeUserLocked(String userId) {
         recognizedUserIds.remove(userId);
         activeE2EEUsers.remove(userId);
-        // TODO: Cleanup decryption
+        var decryptor = userDecryptors.remove(userId);
+        if (decryptor != null) {
+            decryptor.close();
+        }
+        var ratchet = userKeyRatchets.remove(userId);
+        if (ratchet != null) {
+            ratchet.close();
+        }
+    }
+
+    public int decrypt(String userId, MediaType mediaType, ByteBuf output, ByteBuf input) {
+        if (closed) {
+            return -DecryptorResultCode.DECRYPTION_FAILURE.getValue();
+        }
+        if (mediaType == MediaType.AUDIO && input.readableBytes() == 3
+                && input.getByte(input.readerIndex()) == OpusCodecInfo.SILENCE_FRAME[0]
+                && input.getByte(input.readerIndex() + 1) == OpusCodecInfo.SILENCE_FRAME[1]
+                && input.getByte(input.readerIndex() + 2) == OpusCodecInfo.SILENCE_FRAME[2]) {
+            output.writeBytes(input, input.readerIndex(), 3);
+            return DecryptorResultCode.SUCCESS.getValue();
+        }
+        long stamp = sessionLock.readLock();
+        try {
+            var decryptor = userDecryptors.get(userId);
+            if (decryptor == null) {
+                return -DecryptorResultCode.MISSING_CRYPTOR.getValue();
+            }
+            output.ensureWritable(decryptor.getMaxPlaintextByteSize(mediaType, input.readableBytes()));
+            return decryptor.decrypt(mediaType, input, output);
+        } finally {
+            sessionLock.unlockRead(stamp);
+        }
     }
 
     public int encrypt(MediaType mediaType, int ssrc, ByteBuf output, ByteBuf input, int size) {
@@ -280,6 +324,8 @@ public class DAVEManager implements AutoCloseable {
     }
 
     private void updateActiveUsers(RosterMap roster) {
+        var previousUsers = Set.copyOf(activeE2EEUsers.keySet());
+        activeE2EEUsers.clear();
         for (var entry : roster.entrySet()) {
             String userId = String.valueOf(entry.getKey());
             byte[] key = entry.getValue();
@@ -287,6 +333,11 @@ public class DAVEManager implements AutoCloseable {
                 activeE2EEUsers.remove(userId);
             } else {
                 activeE2EEUsers.put(userId, key);
+            }
+        }
+        for (var removed : previousUsers) {
+            if (!activeE2EEUsers.containsKey(removed) && !selfUserIdString.equals(removed)) {
+                setUserKeyRatchet(removed, null);
             }
         }
     }
@@ -302,8 +353,27 @@ public class DAVEManager implements AutoCloseable {
         var keyRatchet = makeKeyRatchetForUser(uid, protocolVersion);
         if (selfUserIdString.equals(uid)) {
             setSelfKeyRatchet(keyRatchet);
-        } else if (keyRatchet != null) {
-            keyRatchet.close();
+        } else {
+            setUserKeyRatchet(uid, keyRatchet);
+        }
+    }
+
+    private void setUserKeyRatchet(String uid, @Nullable KeyRatchet keyRatchet) {
+        var decryptor = userDecryptors.computeIfAbsent(uid, ignored -> {
+            var created = factory.fromDecryptor(factory.createDecryptor());
+            created.transitionToPassthroughMode(true);
+            return created;
+        });
+        var previous = userKeyRatchets.remove(uid);
+        if (keyRatchet == null) {
+            decryptor.transitionToPassthroughMode(true);
+        } else {
+            decryptor.transitionToKeyRatchet(keyRatchet);
+            decryptor.transitionToPassthroughMode(false);
+            userKeyRatchets.put(uid, keyRatchet);
+        }
+        if (previous != null) {
+            previous.close();
         }
     }
 
@@ -399,6 +469,14 @@ public class DAVEManager implements AutoCloseable {
                 selfKeyRatchet = null;
             }
             selfEncryptor.close();
+            for (var decryptor : userDecryptors.values()) {
+                decryptor.close();
+            }
+            userDecryptors.clear();
+            for (var ratchet : userKeyRatchets.values()) {
+                ratchet.close();
+            }
+            userKeyRatchets.clear();
         } finally {
             sessionLock.unlockWrite(stamp);
         }

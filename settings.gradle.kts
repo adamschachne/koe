@@ -20,6 +20,7 @@ dependencyResolutionManagement {
 
             library("slf4j-api", "org.slf4j", "slf4j-api").version("1.8.0-beta4")
             library("logback-classic", "ch.qos.logback", "logback-classic").version("1.5.18")
+            library("junit-jupiter", "org.junit.jupiter", "junit-jupiter").version("5.11.4")
 
             version("lavaplayer", "2.2.6")
             library("lava-common", "dev.arbjerg", "lava-common").versionRef("lavaplayer")

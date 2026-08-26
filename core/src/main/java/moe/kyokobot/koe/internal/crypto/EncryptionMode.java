@@ -13,6 +13,11 @@ public interface EncryptionMode {
 
     boolean box(ByteBuf plain, int start, ByteBuf output, byte[] secretKey);
 
+    /** Decrypts the packet payload after an already-validated RTP header. */
+    default boolean unbox(ByteBuf packet, int headerLength, ByteBuf output, byte[] secretKey) {
+        return false;
+    }
+
     String getName();
 
     static String select(List<String> modes) throws UnsupportedEncryptionModeException {

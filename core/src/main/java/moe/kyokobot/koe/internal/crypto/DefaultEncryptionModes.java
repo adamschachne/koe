@@ -26,9 +26,9 @@ class DefaultEncryptionModes {
         }
 
         modes.put("aead_xchacha20_poly1305_rtpsize", AEADXChaCha20Poly1305RTPSizeEncryptionMode::new); // required by Discord
-        modes.put("xsalsa20_poly1305_lite", XSalsa20Poly1305LiteEncryptionMode::new); // deprecated and discontinued by Discord as of 18th of November 2024
-        modes.put("xsalsa20_poly1305_suffix", XSalsa20Poly1305SuffixEncryptionMode::new); // deprecated and discontinued by Discord as of 18th of November 2024
-        modes.put("xsalsa20_poly1305", XSalsa20Poly1305EncryptionMode::new); // deprecated and discontinued by Discord as of 18th of November 2024
+        // Discord discontinued the XSalsa modes on 18 November 2024. Do not
+        // negotiate a transport mode for which inbound authentication cannot be
+        // implemented with the modern RTP-size contract.
         modes.put("plain", PlainEncryptionMode::new); // not supported by Discord anymore, implemented for testing.
 
         encryptionModes = Collections.unmodifiableMap(modes);

@@ -10,7 +10,6 @@ public class AEADAES256GCMRTPSizeEncryptionMode implements EncryptionMode {
     private static final int NONCE_BYTES_LENGTH = 12;
 
     private final byte[] extendedNonce = new byte[NONCE_BYTES_LENGTH];
-    private final byte[] associatedData = new byte[12];
     private int seq = Math.abs(SECURE_RANDOM.nextInt()) % 418 + 1;
 
     @Override
@@ -25,8 +24,9 @@ public class AEADAES256GCMRTPSizeEncryptionMode implements EncryptionMode {
         extendedNonce[2] = (byte) ((s >> 16) & 0xff);
         extendedNonce[3] = (byte) ((s >> 24) & 0xff);
 
-        // rtp header was already written to output (read without moving reader index)
-        output.getBytes(0, associatedData);
+        // RTP-size modes authenticate every clear-text RTP header byte.
+        var associatedData = new byte[output.readableBytes()];
+        output.getBytes(output.readerIndex(), associatedData);
 
         byte[] c;
         try {
@@ -40,6 +40,27 @@ public class AEADAES256GCMRTPSizeEncryptionMode implements EncryptionMode {
         output.writeBytes(c);
         output.writeIntLE(s);
         return true;
+    }
+
+    @Override
+    public boolean unbox(ByteBuf packet, int headerLength, ByteBuf output, byte[] secretKey) {
+        var encryptedLength = packet.readableBytes() - headerLength - 4;
+        if (headerLength < 12 || encryptedLength < TAG_BYTES_LENGTH) {
+            return false;
+        }
+        var aad = new byte[headerLength];
+        var ciphertext = new byte[encryptedLength];
+        var nonce = new byte[NONCE_BYTES_LENGTH];
+        packet.getBytes(packet.readerIndex(), aad);
+        packet.getBytes(packet.readerIndex() + headerLength, ciphertext);
+        packet.getBytes(packet.writerIndex() - 4, nonce, 0, 4);
+        try {
+            var clear = new InsecureNonceAesGcmJce(secretKey).decrypt(nonce, ciphertext, aad);
+            output.writeBytes(clear);
+            return true;
+        } catch (GeneralSecurityException e) {
+            return false;
+        }
     }
 
     @Override

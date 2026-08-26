@@ -49,4 +49,17 @@ public interface KoeEventListener {
     void externalIPDiscovered(InetSocketAddress address);
 
     void sessionDescription(JsonObject session);
+
+    /**
+     * Called on Koe's UDP event loop after transport and DAVE decryption.
+     * Implementations must copy or enqueue quickly and must never block.
+     */
+    default void audioFrameReceived(ReceivedAudioFrame frame) {
+        // Default keeps existing Koe listeners source and binary compatible.
+    }
+
+    /** Called whenever a newly-created UDP transport becomes current. */
+    default void transportGenerationChanged(long guildId, long channelId, long generation) {
+        // Default keeps existing Koe listeners source and binary compatible.
+    }
 }

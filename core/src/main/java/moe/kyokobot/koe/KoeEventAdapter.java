@@ -45,4 +45,14 @@ public class KoeEventAdapter implements KoeEventListener {
     public void sessionDescription(JsonObject session) {
         //
     }
+
+    @Override
+    public void audioFrameReceived(ReceivedAudioFrame frame) {
+        //
+    }
+
+    @Override
+    public void transportGenerationChanged(long guildId, long channelId, long generation) {
+        //
+    }
 }

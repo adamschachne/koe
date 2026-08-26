@@ -85,6 +85,20 @@ public interface MediaConnection extends Closeable {
     void unregisterListener(KoeEventListener listener);
 
     /**
+     * Serializes a barrier with inbound packets on this connection's UDP event loop.
+     *
+     * @throws IllegalStateException when there is no active UDP transport
+     */
+    default void executeOnTransport(Runnable operation) {
+        throw new UnsupportedOperationException("This transport does not expose event-loop barriers");
+    }
+
+    /** Monotonically increasing within this MediaConnection instance. */
+    default long getTransportGeneration() {
+        return 0;
+    }
+
+    /**
      * Sends speaking state notification to the gateway.
      *
      * @param mask new speaking state

@@ -117,6 +117,7 @@ public class MediaGatewayV4Connection extends AbstractMediaGatewayConnection {
                 var audioSsrc = data.getInt("audio_ssrc", 0);
                 var videoSsrc = data.getInt("video_ssrc", 0);
                 var rtxSsrc = data.getInt("rtx_ssrc", 0);
+                connection.updateUserStreams(user, audioSsrc);
                 connection.getDispatcher().userStreamsChanged(user, audioSsrc, videoSsrc, rtxSsrc);
                 break;
             }
@@ -133,6 +134,7 @@ public class MediaGatewayV4Connection extends AbstractMediaGatewayConnection {
             case Op.CLIENT_DISCONNECT: {
                 var data = object.getObject("d");
                 var user = data.getString("user_id");
+                connection.removeUserStreams(user);
                 connection.getDispatcher().userDisconnected(user);
                 break;
             }

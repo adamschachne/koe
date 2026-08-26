@@ -1,6 +1,7 @@
 package moe.kyokobot.koe.internal;
 
 import moe.kyokobot.koe.KoeEventListener;
+import moe.kyokobot.koe.ReceivedAudioFrame;
 import moe.kyokobot.koe.internal.json.JsonObject;
 
 import java.net.InetSocketAddress;
@@ -81,6 +82,20 @@ public class EventDispatcher implements KoeEventListener {
     public void sessionDescription(JsonObject session) {
         for (var listener : listeners) {
             listener.sessionDescription(session);
+        }
+    }
+
+    @Override
+    public void audioFrameReceived(ReceivedAudioFrame frame) {
+        for (var listener : listeners) {
+            listener.audioFrameReceived(frame);
+        }
+    }
+
+    @Override
+    public void transportGenerationChanged(long guildId, long channelId, long generation) {
+        for (var listener : listeners) {
+            listener.transportGenerationChanged(guildId, channelId, generation);
         }
     }
 }

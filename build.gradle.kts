@@ -6,7 +6,10 @@ plugins {
     id("com.vanniktech.maven.publish") version "0.32.0" apply false
 }
 
-val gitVersionInfo = getGitVersion()
+val gitVersionInfo = providers.gradleProperty("audioReceiveVersion")
+    .orNull
+    ?.let { VersionInfo(it, false) }
+    ?: getGitVersion()
 logger.lifecycle("Version: ${gitVersionInfo.version} (isCommitHash: ${gitVersionInfo.isCommitHash})")
 
 subprojects {
@@ -34,6 +37,13 @@ subprojects {
         maven {
             url = uri("https://jitpack.io/")
         }
+    }
+    dependencyLocking {
+        lockAllConfigurations()
+    }
+    tasks.withType<AbstractArchiveTask>().configureEach {
+        isPreserveFileTimestamps = false
+        isReproducibleFileOrder = true
     }
     if (name != "testbot") {
         apply(plugin = "com.vanniktech.maven.publish")

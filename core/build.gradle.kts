@@ -12,6 +12,11 @@ dependencies {
     implementation(libs.libdave.api)
     implementation(libs.libdave.impl.jni)
     implementation(libs.jetbrains.annotations)
+    testImplementation(libs.junit.jupiter)
+}
+
+tasks.test {
+    useJUnitPlatform()
 }
 
 mavenPublishing {

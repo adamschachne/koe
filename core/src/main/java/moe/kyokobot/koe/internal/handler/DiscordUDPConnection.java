@@ -27,6 +27,8 @@ import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.Map;
 
 public class DiscordUDPConnection implements Closeable, ConnectionHandler<InetSocketAddress> {
     private static final Logger logger = LoggerFactory.getLogger(DiscordUDPConnection.class);
@@ -36,21 +38,40 @@ public class DiscordUDPConnection implements Closeable, ConnectionHandler<InetSo
     private final SocketAddress serverAddress;
     private final Bootstrap bootstrap;
     private final int ssrc;
+    private final long channelId;
+    private final long transportGeneration;
 
     private volatile EncryptionMode encryptionMode;
     private volatile DatagramChannel channel;
     private volatile byte[] secretKey;
 
+    private final AtomicLong udpPackets = new AtomicLong();
+    private final AtomicLong plausibleAudioPackets = new AtomicLong();
+    private final AtomicLong outboundSsrcPackets = new AtomicLong();
+    private final AtomicLong unknownSsrcPackets = new AtomicLong();
+    private final AtomicLong transportDecryptFailures = new AtomicLong();
+    private final AtomicLong daveDecryptFailures = new AtomicLong();
+    private final AtomicLong dispatchedFrames = new AtomicLong();
+    private final AtomicLong outboundFrameAttempts = new AtomicLong();
+    private final AtomicLong outboundDaveFailures = new AtomicLong();
+    private final AtomicLong outboundTransportFailures = new AtomicLong();
+    private final AtomicLong outboundPacketBuildFailures = new AtomicLong();
+    private final AtomicLong outboundPackets = new AtomicLong();
+    private final AtomicLong lastUdpPacketNanos = new AtomicLong();
+    private final AtomicLong lastDispatchedFrameNanos = new AtomicLong();
+
     private char seq;
 
     public DiscordUDPConnection(MediaConnectionImpl voiceConnection,
                                 SocketAddress serverAddress,
-                                int ssrc) {
+                                int ssrc, long channelId, long transportGeneration) {
         this.connection = voiceConnection;
         this.allocator = voiceConnection.getOptions().getByteBufAllocator();
         this.serverAddress = Objects.requireNonNull(serverAddress);
         this.bootstrap = NettyBootstrapFactory.datagram(voiceConnection.getOptions());
         this.ssrc = ssrc;
+        this.channelId = channelId;
+        this.transportGeneration = transportGeneration;
         // should be a random value https://tools.ietf.org/html/rfc1889#section-5.1
         this.seq = (char) (ThreadLocalRandom.current().nextInt() & 0xffff);
     }
@@ -112,8 +133,10 @@ public class DiscordUDPConnection implements Closeable, ConnectionHandler<InetSo
 
     @Override
     public void sendFrame(CodecType codecType, byte payloadType, int timestamp, ByteBuf data, int len, boolean extension) {
+        outboundFrameAttempts.incrementAndGet();
         var buf = createPacket(codecType, payloadType, timestamp, data, len, extension);
         if (buf != null) {
+            outboundPackets.incrementAndGet();
             channel.writeAndFlush(buf);
         }
     }
@@ -141,7 +164,8 @@ public class DiscordUDPConnection implements Closeable, ConnectionHandler<InetSo
                 inputLen = inputBuffer.readableBytes();
 
                 if (result < 0) {
-                    logger.debug("DAVE encryption failed with code {}", result);
+                    logOutboundDrop(outboundDaveFailures.incrementAndGet(),
+                            "DAVE encrypt", result);
                     return null;
                 }
             } else {
@@ -160,9 +184,15 @@ public class DiscordUDPConnection implements Closeable, ConnectionHandler<InetSo
             }
 
             logger.debug("Encryption failed!");
+            logOutboundDrop(outboundTransportFailures.incrementAndGet(),
+                    "transport encrypt", 0);
             return null;
         } catch (Exception e) {
-            logger.debug("Encryption exception!", e);
+            long count = outboundPacketBuildFailures.incrementAndGet();
+            if (count == 1 || count == 10 || count == 100 || count % 1000 == 0) {
+                logger.warn("Outbound audio packet build failed guild={} count={}",
+                        connection.getGuildId(), count, e);
+            }
             return null;
         } finally {
             if (buf != null && buf.refCnt() > 0) {
@@ -193,6 +223,14 @@ public class DiscordUDPConnection implements Closeable, ConnectionHandler<InetSo
         return ssrc;
     }
 
+    public long getChannelId() {
+        return channelId;
+    }
+
+    public long getTransportGeneration() {
+        return transportGeneration;
+    }
+
     public EncryptionMode getEncryptionMode() {
         return encryptionMode;
     }
@@ -211,6 +249,65 @@ public class DiscordUDPConnection implements Closeable, ConnectionHandler<InetSo
             throw new IllegalStateException("Discord UDP transport is not active");
         }
         current.eventLoop().execute(operation);
+    }
+
+    void noteUdpPacket() {
+        udpPackets.incrementAndGet();
+        lastUdpPacketNanos.set(System.nanoTime());
+    }
+
+    void notePlausibleAudioPacket() {
+        plausibleAudioPackets.incrementAndGet();
+    }
+
+    void noteOutboundSsrcPacket() {
+        outboundSsrcPackets.incrementAndGet();
+    }
+
+    long noteUnknownSsrcPacket() {
+        return unknownSsrcPackets.incrementAndGet();
+    }
+
+    long noteTransportDecryptFailure() {
+        return transportDecryptFailures.incrementAndGet();
+    }
+
+    long noteDaveDecryptFailure() {
+        return daveDecryptFailures.incrementAndGet();
+    }
+
+    void noteDispatchedFrame() {
+        dispatchedFrames.incrementAndGet();
+        lastDispatchedFrameNanos.set(System.nanoTime());
+    }
+
+    public void appendReceiveDiagnostics(Map<String, Long> values) {
+        long now = System.nanoTime();
+        values.put("udpPackets", udpPackets.get());
+        values.put("plausibleAudioPackets", plausibleAudioPackets.get());
+        values.put("outboundSsrcPackets", outboundSsrcPackets.get());
+        values.put("unknownSsrcPackets", unknownSsrcPackets.get());
+        values.put("transportDecryptFailures", transportDecryptFailures.get());
+        values.put("daveDecryptFailures", daveDecryptFailures.get());
+        values.put("dispatchedFrames", dispatchedFrames.get());
+        values.put("outboundFrameAttempts", outboundFrameAttempts.get());
+        values.put("outboundDaveFailures", outboundDaveFailures.get());
+        values.put("outboundTransportFailures", outboundTransportFailures.get());
+        values.put("outboundPacketBuildFailures", outboundPacketBuildFailures.get());
+        values.put("outboundPackets", outboundPackets.get());
+        values.put("lastUdpPacketAgeMs", ageMillis(now, lastUdpPacketNanos.get()));
+        values.put("lastDispatchedFrameAgeMs", ageMillis(now, lastDispatchedFrameNanos.get()));
+    }
+
+    private static long ageMillis(long now, long then) {
+        return then == 0 ? -1 : Math.max(0, (now - then) / 1_000_000);
+    }
+
+    private void logOutboundDrop(long count, String stage, int code) {
+        if (count == 1 || count == 10 || count == 100 || count % 1000 == 0) {
+            logger.warn("Outbound audio dropped guild={} stage={} code={} count={}",
+                    connection.getGuildId(), stage, code, count);
+        }
     }
 
     private static class Initializer extends ChannelInitializer<DatagramChannel> {

@@ -33,6 +33,7 @@ final class InboundAudioHandler extends SimpleChannelInboundHandler<DatagramPack
 
     @Override
     protected void channelRead0(ChannelHandlerContext ctx, DatagramPacket datagram) {
+        udp.noteUdpPacket();
         var packet = datagram.content();
         if (!isPlausibleRtp(packet)) {
             // Preserve Koe's existing downstream RTCP path. This handler owns
@@ -41,12 +42,15 @@ final class InboundAudioHandler extends SimpleChannelInboundHandler<DatagramPack
             ctx.fireChannelRead(datagram.retain());
             return;
         }
+        udp.notePlausibleAudioPacket();
         int ssrc = packet.getInt(packet.readerIndex() + 8);
         if (ssrc == udp.getSsrc()) {
+            udp.noteOutboundSsrcPacket();
             return;
         }
         var userId = connection.getUserIdForAudioSsrc(ssrc);
         if (userId == null) {
+            logDrop(udp.noteUnknownSsrcPacket(), "unknown SSRC", ssrc, 0);
             if (pendingUnknown.incrementAndGet() > MAX_PENDING_UNKNOWN) {
                 pendingUnknown.decrementAndGet();
                 return;
@@ -97,6 +101,9 @@ final class InboundAudioHandler extends SimpleChannelInboundHandler<DatagramPack
         int extensionProfile = 0;
         int extensionWords = 0;
         if (hasExtension) {
+            // Discord's RTP-size modes follow SRTP: the extension preamble is
+            // clear text and authenticated as part of the variable RTP
+            // header, while the extension body remains encrypted.
             if (packet.readableBytes() < headerLength + 4) {
                 return;
             }
@@ -104,7 +111,6 @@ final class InboundAudioHandler extends SimpleChannelInboundHandler<DatagramPack
             extensionWords = packet.getUnsignedShort(offset + headerLength + 2);
             headerLength += 4;
         }
-
         var transportClear = udp.allocator().directBuffer();
         var opus = udp.allocator().directBuffer();
         try {
@@ -112,19 +118,27 @@ final class InboundAudioHandler extends SimpleChannelInboundHandler<DatagramPack
             var secretKey = udp.getSecretKey();
             if (mode == null || secretKey == null
                     || !mode.unbox(packet, headerLength, transportClear, secretKey)) {
+                logDrop(udp.noteTransportDecryptFailure(), "transport decrypt",
+                        packet.getInt(offset + 8), 0);
                 return;
             }
-            int extensionBytes = extensionWords * 4;
-            if (extensionBytes > transportClear.readableBytes()) {
-                return;
+            if (hasExtension) {
+                int extensionBytes = extensionWords * 4;
+                if (extensionBytes > transportClear.readableBytes()) {
+                    return;
+                }
+                transportClear.skipBytes(extensionBytes);
             }
-            transportClear.skipBytes(extensionBytes);
 
             var dave = connection.getDAVEManager();
             boolean daveEnabled = dave != null && dave.getCurrentProtocolVersion() > 0;
             if (dave != null) {
                 int result = dave.decrypt(userId, MediaType.AUDIO, opus, transportClear);
-                if (result != DecryptorResultCode.SUCCESS.getValue()) {
+                // libdave returns the plaintext byte count on success and a
+                // negative DecryptorResultCode value on failure.
+                if (result < DecryptorResultCode.SUCCESS.getValue()) {
+                    logDrop(udp.noteDaveDecryptFailure(), "DAVE decrypt",
+                            packet.getInt(offset + 8), result);
                     logger.debug("DAVE receive failed for guild={} user={} ssrc={} code={}",
                             connection.getGuildId(), userId,
                             Integer.toUnsignedLong(packet.getInt(offset + 8)), result);
@@ -139,7 +153,8 @@ final class InboundAudioHandler extends SimpleChannelInboundHandler<DatagramPack
             }
             byte[] opusBytes = new byte[opus.readableBytes()];
             opus.getBytes(opus.readerIndex(), opusBytes);
-            connection.dispatchInboundAudio(
+            if (connection.dispatchInboundAudio(
+                    udp,
                     packet.getInt(offset + 8),
                     packet.getUnsignedShort(offset + 2),
                     packet.getUnsignedInt(offset + 4),
@@ -149,12 +164,21 @@ final class InboundAudioHandler extends SimpleChannelInboundHandler<DatagramPack
                     csrcs,
                     extensionProfile,
                     extensionWords,
-                    opusBytes);
+                    opusBytes)) {
+                udp.noteDispatchedFrame();
+            }
         } catch (RuntimeException exception) {
             logger.debug("Discarding malformed inbound Discord RTP packet", exception);
         } finally {
             transportClear.release();
             opus.release();
+        }
+    }
+
+    private void logDrop(long count, String stage, int ssrc, int code) {
+        if (count == 1 || count == 10 || count == 100 || count % 1000 == 0) {
+            logger.warn("Inbound audio dropped guild={} stage={} ssrc={} code={} count={}",
+                    connection.getGuildId(), stage, Integer.toUnsignedLong(ssrc), code, count);
         }
     }
 }

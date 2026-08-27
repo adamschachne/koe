@@ -17,10 +17,14 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.Objects;
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import moe.kyokobot.koe.internal.handler.DiscordUDPConnection;
 
 public class MediaConnectionImpl implements MediaConnection, MediaConnectionExperimental {
@@ -30,19 +34,21 @@ public class MediaConnectionImpl implements MediaConnection, MediaConnectionExpe
     private final long guildId;
     private final EventDispatcher dispatcher;
 
-    private MediaGatewayConnection gatewayConnection;
-    private ConnectionHandler<?> connectionHandler;
-    private VoiceServerInfo info;
+    private volatile MediaGatewayConnection gatewayConnection;
+    private volatile ConnectionHandler<?> connectionHandler;
+    private volatile VoiceServerInfo info;
     private CodecInstance audioCodec;
     private CodecInstance videoCodec;
     private AbstractFramePoller audioPoller;
     private AbstractFramePoller videoPoller;
     private AudioFrameProvider audioSender;
     private VideoFrameProvider videoSender;
-    private DAVEManager daveManager;
+    private volatile DAVEManager daveManager;
     private final Map<Integer, String> audioSsrcUsers = new ConcurrentHashMap<>();
     private final Map<String, Integer> userAudioSsrcs = new ConcurrentHashMap<>();
     private final AtomicLong transportGeneration = new AtomicLong();
+    private final AtomicBoolean receiveEnabled = new AtomicBoolean();
+    private final AtomicInteger lastSpeakingMask = new AtomicInteger();
 
     public MediaConnectionImpl(@NotNull KoeClientImpl client, long guildId) {
         this.client = Objects.requireNonNull(client);
@@ -68,12 +74,12 @@ public class MediaConnectionImpl implements MediaConnection, MediaConnectionExpe
         return conn.start().thenAccept(nothing -> {
             MediaConnectionImpl.this.info = info;
             MediaConnectionImpl.this.gatewayConnection = conn;
-            dispatcher.transportGenerationChanged(guildId, info.getChannelId(), generation);
-
             MediaValve valve = conn.getValve();
             if (valve != null && getOptions().isDeafened()) {
                 valve.setDeafen(true);
+                valve.sendToGateway();
             }
+            dispatcher.transportGenerationChanged(guildId, info.getChannelId(), generation);
         });
     }
 
@@ -93,6 +99,8 @@ public class MediaConnectionImpl implements MediaConnection, MediaConnectionExpe
             connectionHandler = null;
         }
 
+        info = null;
+        receiveEnabled.set(false);
         this.destroyDAVEManager();
     }
 
@@ -282,6 +290,47 @@ public class MediaConnectionImpl implements MediaConnection, MediaConnectionExpe
     }
 
     @Override
+    public void setReceiveEnabled(boolean enabled) {
+        var gateway = gatewayConnection;
+        if (gateway == null) {
+            if (enabled) {
+                throw new IllegalStateException("Voice gateway is not active");
+            }
+            return;
+        }
+        var valve = gateway.getValve();
+        if (valve != null) {
+            valve.setDeafen(!enabled);
+            valve.sendToGateway();
+            receiveEnabled.set(enabled);
+        } else if (enabled) {
+            throw new IllegalStateException("Voice media sink is not available");
+        }
+    }
+
+    @Override
+    public Map<String, Long> getReceiveDiagnostics() {
+        var values = new LinkedHashMap<String, Long>();
+        var gateway = gatewayConnection;
+        var handler = connectionHandler;
+        var manager = daveManager;
+        values.put("transportGeneration", transportGeneration.get());
+        values.put("voiceGatewayOpen", gateway != null && gateway.isOpen() ? 1L : 0L);
+        values.put("udpTransportActive", handler instanceof DiscordUDPConnection ? 1L : 0L);
+        values.put("receiveEnabled", receiveEnabled.get() ? 1L : 0L);
+        values.put("mediaSinkWantsAny", receiveEnabled.get() ? 100L : 0L);
+        values.put("mappedAudioSsrcs", (long) audioSsrcUsers.size());
+        values.put("daveProtocolVersion",
+                manager == null ? 0L : (long) manager.getCurrentProtocolVersion());
+        values.put("audioPolling", audioPoller != null && audioPoller.isPolling() ? 1L : 0L);
+        values.put("lastSpeakingMask", (long) lastSpeakingMask.get());
+        if (handler instanceof DiscordUDPConnection) {
+            ((DiscordUDPConnection) handler).appendReceiveDiagnostics(values);
+        }
+        return Collections.unmodifiableMap(values);
+    }
+
+    @Override
     public void close() {
         if (this.audioSender != null) {
             this.audioSender.dispose();
@@ -299,6 +348,7 @@ public class MediaConnectionImpl implements MediaConnection, MediaConnectionExpe
 
     @Override
     public void updateSpeakingState(int mask) {
+        lastSpeakingMask.set(mask);
         if (this.gatewayConnection != null) {
             this.gatewayConnection.updateSpeaking(mask);
         }
@@ -313,14 +363,19 @@ public class MediaConnectionImpl implements MediaConnection, MediaConnectionExpe
     }
 
     public void updateUserStreams(String userId, int audioSsrc) {
+        var manager = daveManager;
+        if (manager != null) {
+            manager.addUser(userId);
+        }
         var previous = userAudioSsrcs.remove(userId);
         if (previous != null) {
             audioSsrcUsers.remove(previous, userId);
         }
-        if (audioSsrc != 0) {
-            userAudioSsrcs.put(userId, audioSsrc);
-            audioSsrcUsers.put(audioSsrc, userId);
+        if (audioSsrc == 0) {
+            return;
         }
+        userAudioSsrcs.put(userId, audioSsrc);
+        audioSsrcUsers.put(audioSsrc, userId);
     }
 
     public void removeUserStreams(String userId) {
@@ -335,32 +390,34 @@ public class MediaConnectionImpl implements MediaConnection, MediaConnectionExpe
         return audioSsrcUsers.get(audioSsrc);
     }
 
-    public void dispatchInboundAudio(int ssrc, int sequence, long timestamp,
+    public boolean dispatchInboundAudio(DiscordUDPConnection source, int ssrc,
+                                     int sequence, long timestamp,
                                      long receivedNanos, boolean marker, boolean dave,
                                      int[] csrcs, int extensionProfile, int extensionWords,
                                      byte[] opus) {
+        if (connectionHandler != source
+                || source.getTransportGeneration() != transportGeneration.get()) {
+            return false;
+        }
         var user = audioSsrcUsers.get(ssrc);
         if (user == null) {
-            return;
+            return false;
         }
         long userId;
         try {
             userId = Long.parseUnsignedLong(user);
         } catch (NumberFormatException ignored) {
             logger.warn("Ignoring invalid Discord voice user ID {}", user);
-            return;
+            return false;
         }
         if (userId == client.getClientId() || ssrc == getOutboundSsrc()) {
-            return;
-        }
-        var voiceInfo = info;
-        if (voiceInfo == null) {
-            return;
+            return false;
         }
         dispatcher.audioFrameReceived(new ReceivedAudioFrame(
-                guildId, voiceInfo.getChannelId(), userId, ssrc, sequence, timestamp,
-                transportGeneration.get(), receivedNanos, marker, dave, csrcs,
+                guildId, source.getChannelId(), userId, ssrc, sequence, timestamp,
+                source.getTransportGeneration(), receivedNanos, marker, dave, csrcs,
                 extensionProfile, extensionWords, opus));
+        return true;
     }
 
     private int getOutboundSsrc() {

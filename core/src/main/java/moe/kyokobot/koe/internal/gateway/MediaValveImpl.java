@@ -29,11 +29,11 @@ public class MediaValveImpl implements MediaValve {
         this.gatewayConnection = gatewayConnection;
     }
 
-    @Override public boolean isDeafened() {
+    @Override public synchronized boolean isDeafened() {
         return deafen;
     }
 
-    @Override public void setDeafen(boolean deafen) {
+    @Override public synchronized void setDeafen(boolean deafen) {
         this.deafen = deafen;
     }
 
@@ -79,7 +79,7 @@ public class MediaValveImpl implements MediaValve {
         }
     }
 
-    @Override public void removeUser(String userId) {
+    @Override public synchronized void removeUser(String userId) {
         LOG.debug("Removing streams for user {}", userId);
         this.unwantedStreams.remove(userId);
         this.sendToGateway();

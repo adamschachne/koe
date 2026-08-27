@@ -9,6 +9,8 @@ import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 import java.io.Closeable;
+import java.util.Collections;
+import java.util.Map;
 import java.util.concurrent.CompletionStage;
 
 public interface MediaConnection extends Closeable {
@@ -96,6 +98,16 @@ public interface MediaConnection extends Closeable {
     /** Monotonically increasing within this MediaConnection instance. */
     default long getTransportGeneration() {
         return 0;
+    }
+
+    /** Enable or disable inbound media subscriptions for this voice transport. */
+    default void setReceiveEnabled(boolean enabled) {
+        throw new UnsupportedOperationException("This transport does not expose receive controls");
+    }
+
+    /** Read-only receive-pipeline counters and gauges for operational diagnostics. */
+    default Map<String, Long> getReceiveDiagnostics() {
+        return Collections.emptyMap();
     }
 
     /**

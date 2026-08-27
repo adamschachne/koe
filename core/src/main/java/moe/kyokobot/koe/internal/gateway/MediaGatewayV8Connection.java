@@ -143,6 +143,11 @@ public class MediaGatewayV8Connection extends AbstractMediaGatewayConnection {
                 logger.debug("Resumed successfully");
                 break;
             }
+            case Op.SPEAKING: {
+                var data = object.getObject("d");
+                connection.updateUserStreams(data.getString("user_id"), data.getInt("ssrc"));
+                break;
+            }
             case Op.VIDEO: {
                 mediaValve.handleEvent(object);
 
@@ -378,7 +383,8 @@ public class MediaGatewayV8Connection extends AbstractMediaGatewayConnection {
 
         // known values: ["udp", "webrtc"]
         if (protocol.equals("udp")) {
-            var conn = new DiscordUDPConnection(connection, address, ssrc);
+            var conn = new DiscordUDPConnection(connection, address, ssrc,
+                    voiceServerInfo.getChannelId(), connection.getTransportGeneration());
             conn.connect().thenAccept(ourAddress -> {
                 logger.debug("Connected, our external address is: {}", ourAddress);
                 connection.getDispatcher().externalIPDiscovered(ourAddress);

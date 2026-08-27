@@ -60,17 +60,22 @@ class EncryptionModeReceiveTest {
     }
 
     @Test
-    void extensionPreambleIsAssociatedDataAndExtensionBodyIsEncrypted() {
+    void extensionPreambleIsAuthenticatedAndBodyIsEncrypted() {
         EncryptionMode mode = new AEADAES256GCMRTPSizeEncryptionMode();
         ByteBuf packet = packetWithHeader();
         packet.setByte(0, 0x90);
         packet.writeShort(0xbede);
         packet.writeShort(1);
-        byte[] clear = new byte[]{1, 2, 3, 4, OPUS[0], OPUS[1], OPUS[2]};
+        byte[] clear = new byte[]{
+                1, 2, 3, 4, OPUS[0], OPUS[1], OPUS[2]
+        };
         ByteBuf plain = Unpooled.wrappedBuffer(clear);
         ByteBuf output = Unpooled.buffer();
         try {
             assertTrue(mode.box(plain, clear.length, packet, KEY));
+            assertFalse(mode.unbox(packet, 12, output, KEY),
+                    "the extension preamble is part of the authenticated RTP header");
+            output.clear();
             assertTrue(mode.unbox(packet, 16, output, KEY));
             byte[] actual = new byte[output.readableBytes()];
             output.readBytes(actual);

@@ -93,7 +93,7 @@ public class DAVEManager implements AutoCloseable {
     }
 
     private void addUserLocked(String userId) {
-        recognizedUserIds.add(userId);
+        boolean added = recognizedUserIds.add(userId);
         if (selfUserIdString.equals(userId)) {
             return;
         }
@@ -102,7 +102,7 @@ public class DAVEManager implements AutoCloseable {
             decryptor.transitionToPassthroughMode(true);
             return decryptor;
         });
-        if (currentProtocolVersion > 0 && activeE2EEUsers.containsKey(userId)) {
+        if (added && currentProtocolVersion > 0 && activeE2EEUsers.containsKey(userId)) {
             setupKeyRatchetForUser(userId, currentProtocolVersion);
         }
     }
